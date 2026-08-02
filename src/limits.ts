@@ -7,7 +7,7 @@
 export const MAX_IMAGE_CHARS = 120 * 1024 * 1024
 
 /** 캐릭터 스탠딩/표정 두상 배열 개수 상한(스탠딩 개수제한). */
-export const MAX_STANDINGS = 34
+export const MAX_STANDINGS = 24
 
 /** 월드 좌표 절대 한도(px) — NaN/Infinity·초대형 좌표 차단(token:move/upsert·핑). */
 export const MAX_WORLD_COORD = 1_000_000

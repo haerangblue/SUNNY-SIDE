@@ -56,7 +56,11 @@ function splitLines(buf: Buffer): Buffer[] {
 /** 저장이 이만큼 넘게 안 끝나면 매달린 것으로 보고 관리 화면에 알린다. */
 const STUCK_FLUSH_MS = 60_000
 /** 방당 메시지 보관 상한. 세션방 영속(전체 채팅 보관, 소유자가 비울 때까지) — 폭주 방지용 큰 상한. */
+// ⚠ 클라 런타임 상한(src/renderer/src/store/useChatStore.ts 의 RUNTIME_CHAT_LIMIT)과 같은 값이어야 한다.
+// 클라가 더 작으면 입장할 때 받은 앞부분을 도로 버려 화면·내보내기에서 대화가 사라진다.
 const MAX_HISTORY = 20000
+/** 캐릭터 보관대 상한 — 한 방에서 오간 저널이 아무리 많아도 이만큼만 남긴다(오래된 것부터 덜어 낸다). */
+const MAX_CHAR_POOL = 200
 /** 맵당 오브젝트 개수 상한 — 방 상태 팽창 방어(coerceLoadedMap 모든 진입점 적용). */
 const MAX_TOKENS_PER_MAP = 2000
 /** 방이 들고 있는 GM 선택지 개수 상한 — 넘으면 오래된 것부터 버린다(옵션 스크립트가 무거워 무제한 불가). */
@@ -92,7 +96,12 @@ export interface Room {
   members: Set<string> // 참여한 적 있는 계정 id(목록용 · 소유자 포함)
   cardImage?: string // 세션 카드 이미지(1200×600 data URL)
   participants: Map<string, Participant> // key: playerId
-  characters: Map<string, SharedCharacter> // key: playerId (프레즌스 서브셋)
+  characters: Map<string, SharedCharacter> // key: playerId (프레즌스 서브셋 · 지금 장착한 캐릭터 한 명)
+  /**
+   * 캐릭터 보관대 — key: playerId + charId. 로스터에서 밀려난 캐릭터도 여기 남아,
+   * 맵에 놓아 둔 그 캐릭터의 토큰이 이름·색·두상·수치를 잃지 않는다. 영속.
+   */
+  charPool: Map<string, SharedCharacter>
   handouts: Map<string, Handout> // key: handout id (GM 자료)
   maps: Map<string, RoomMap> // key: map id (맵세트)
   activeMapId: string // 전원이 보는 활성 맵
@@ -101,6 +110,11 @@ export interface Room {
   cutInImages?: Partial<Record<SuccessLevel, string>> // 성공 단계별 연출 카드(GM 설정 · 전원 동기화)
   dimColor?: string // ~문장~ 행동지문 색(GM 설정 · 전원 동기화 · hex)
   madnessTables?: MadnessTables // GM 커스텀 광기표 — 미설정이면 클라 기본 표. 전원 동기화·영속.
+  /**
+   * 입실 잠금(공사중). 켜면 방을 만든 사람 말고는 못 들어온다 — 준비 중인 방에 초대 코드를 아는
+   * 사람이 불쑥 들어오는 것을 막는다. 이미 들어와 있는 사람은 내보내지 않는다. 영속.
+   */
+  locked?: boolean
   luckEnabled?: boolean // 행운 깎기(CoC7 하우스룰) 사용 여부 — GM 토글·전원 동기화·영속. 미설정=사용(기본).
   vnOverlay?: boolean // 일반 맵 위 VN 오버레이(대사창+발화자 스탠딩) 표시 — GM 토글·전원 동기화·영속. 미설정=꺼짐.
   bgm: BgmState[] // 방 BGM 트랙들 (다중, GM 제어·전원 동기화 · 최대 5)
@@ -403,6 +417,7 @@ function coerceToken(t: unknown): Token | null {
     h: coerceSpanCells(o.h),
     rotation: typeof o.rotation === 'number' && Number.isFinite(o.rotation) ? o.rotation : undefined,
     charPlayerId: capId(o.charPlayerId),
+    charId: capId(o.charId),
     label: typeof o.label === 'string' ? o.label.slice(0, 200) : undefined,
     color: typeof o.color === 'string' ? o.color.slice(0, 32) : undefined,
     image: capImage(o.image),
@@ -700,7 +715,7 @@ function packAvatars(messages: ChatMessage[]): { messages: ChatMessage[]; avatar
  * 이 방의 채팅 두상이 자산 저장소에 어떤 이름으로 들어가 있는지 모아 준다(자산 GC 라이브 집합).
  *
  * 두상은 방에는 data URL 로 남고, 입장 스냅샷을 보낼 때만 자산으로 내부화된다. 그래서 'asset:' 문자열만
- * 훑는 수집기는 그 파일을 못 찾아 '아무도 안 쓴다'고 판정했다. 같은 두상이 수천 줄에 반복되므로
+ * 훑는 수집기는 그 파일을 못 찾아 '아무도 안 쓴다'고 판정한다. 같은 두상이 수천 줄에 반복되므로
  * 문자열→해시 결과를 방 단위로 기억해 두 번 계산하지 않는다.
  */
 function collectAvatarHashes(room: Room, into: Set<string>): void {
@@ -847,7 +862,7 @@ function coerceDisplaySec(v: unknown, image: string | undefined): number | undef
 const MARKUP_TAG_RE = /\[(\/?)([a-z]+)(?:=[^\]]*)?\]/g
 const MARKUP_TAGS = new Set([
   'b', 'i', 'u', 's', 'color', 'bg', 'size', 'ruby', 'center', 'right', 'left',
-  'box', 'bubble', 'bar', 'img', 'dim', 'roll'
+  'box', 'bubble', 'bar', 'img', 'dim', 'roll', 'css'
 ])
 /** 보이드 태그 — 그 자리에 별도 객체(이미지·굴림 숫자·막대)가 렌더되므로 공백으로 치환해,
  *  앞뒤 글자가 이어붙어 화면에 없는 단어가 생기는 오발동을 막는다. 감싸기 태그는 표시 폭이 없어 제거. */
@@ -900,6 +915,69 @@ function coerceGlobalTokens(v: unknown): Map<string, Token> | undefined {
   return tokens.size ? tokens : undefined
 }
 
+/**
+ * 보관대에 담을 몫만 남긴다.
+ *
+ * 보관대는 방 파일에 저장되고 입장할 때 전원에게 전달되므로, **토큰이 그리는 데 쓰는 것만** 담는다.
+ * 배너(계정 배너 · 1.2MB 캡)와 표정별 두상 묶음(최대 24장)은 토큰과 무관한데, 그냥 복사하면 사람×캐릭터
+ * 조합만큼 중복돼 방 파일과 입장 전송이 수십 MB 로 부푼다.
+ */
+function poolSubset(c: SharedCharacter): SharedCharacter {
+  return {
+    playerId: c.playerId,
+    charId: c.charId,
+    name: c.name,
+    color: c.color,
+    nameColor: c.nameColor,
+    headshot: c.headshot, // 원형 토큰 그림
+    standings: c.standings, // 스탠딩 토큰(자산 참조라 가볍다)
+    currentExpression: c.currentExpression,
+    standingHeight: c.standingHeight,
+    stats: c.stats, // 토큰 위 HP/MP/SAN 바
+    visibility: c.visibility
+  }
+}
+
+/** 파일에서 읽은 보관대 — 형태를 깎고 상한까지 적용해 되살린다. */
+function loadCharPool(v: unknown): Map<string, SharedCharacter> {
+  const out = new Map<string, SharedCharacter>()
+  if (!Array.isArray(v)) return out
+  for (const raw of v) {
+    if (out.size >= MAX_CHAR_POOL) break
+    const c = raw as SharedCharacter | null
+    const key = poolKey(c?.playerId, c?.charId)
+    if (!key || !c) continue
+    out.set(key, poolSubset({
+      ...c,
+      name: typeof c.name === 'string' ? c.name.slice(0, 100) : '',
+      color: typeof c.color === 'string' ? c.color.slice(0, 32) : '#7c9cff',
+      headshot: capImage(c.headshot),
+      standings: capImageList(c.standings)
+    }))
+  }
+  return out
+}
+
+/** 보관대 상한 적용 — 넘치면 오래 안 쓴 앞자리부터 덜어 낸다. */
+function trimCharPool(room: Room): void {
+  if (room.charPool.size <= MAX_CHAR_POOL) return
+  const drop = room.charPool.size - MAX_CHAR_POOL
+  let n = 0
+  for (const k of [...room.charPool.keys()]) {
+    if (n++ >= drop) break
+    room.charPool.delete(k)
+  }
+}
+
+/**
+ * 캐릭터 보관대 색인 키 — 사람과 캐릭터를 함께 잡는다. 둘 중 하나라도 비면 담지 않는다.
+ * 앞자리 길이를 붙여 잇는 이유: 구분자 한 글자로 이으면 그 글자가 id 안에 섞였을 때
+ * 다른 조합이 같은 키가 되어 남의 캐릭터를 가리키게 된다.
+ */
+function poolKey(playerId: string | undefined, charId: string | undefined): string {
+  return playerId && charId ? playerId.length + ':' + playerId + charId : ''
+}
+
 /** 방 → 영속 파일(JSON). 장면·메타·멤버·전체 채팅. 참가자/프레즌스는 런타임이라 제외. */
 function roomToFile(room: Room): Record<string, unknown> {
   const { messages, avatarPool } = packAvatars(room.messages) // 채팅 두상 풀 분리 — 파일 크기 절감
@@ -927,9 +1005,12 @@ function roomToFile(room: Room): Record<string, unknown> {
     dimColor: room.dimColor,
     madnessTables: room.madnessTables, // GM 커스텀 광기표
     luckEnabled: room.luckEnabled, // 행운 깎기 사용 여부
+    locked: room.locked, // 입실 잠금(공사중)
     vnOverlay: room.vnOverlay, // 일반 맵 VN 오버레이 표시 여부
     bgm: room.bgm,
     channels: [...room.channels.values()],
+    // 캐릭터 보관대 — 맵 토큰이 charId 로 참조하므로 재시작 뒤에도 있어야 토큰이 이름·수치를 되찾는다.
+    charPool: [...room.charPool.values()],
     messages,
     avatarPool, // 채팅 두상 풀
     charRooms: Object.fromEntries(room.charRooms), // 방별 시트 멤버십
@@ -1014,6 +1095,10 @@ function roomFromFile(data: unknown): Room | null {
     cardImage: typeof o.cardImage === 'string' && o.cardImage ? o.cardImage : undefined,
     participants, // 영속 복원된 세션 멤버(전부 오프라인) — 재접속 시 admit 이 connected 갱신
     characters: new Map(),
+    // 로스터(characters)는 접속 중인 사람의 것이라 비우고 시작하지만, 보관대는 맵 토큰이 참조하므로 되살린다.
+    // 파일에서 온 값도 같은 규칙으로 깎는다 — 다른 필드는 전부 캡을 거치는데 여기만 날것으로 두면
+    // 멤버가 올린 번들 하나로 방 파일·입장 전송이 통째로 부푼다.
+    charPool: loadCharPool(o.charPool),
     handouts,
     maps,
     activeMapId:
@@ -1025,6 +1110,7 @@ function roomFromFile(data: unknown): Room | null {
     cutInImages: coerceCutInImages(o.cutInImages),
     dimColor: coerceDimColor(o.dimColor),
     madnessTables: coerceMadnessTables(o.madnessTables), // GM 커스텀 광기표
+    locked: o.locked === true ? true : undefined, // 입실 잠금(공사중)
     luckEnabled: typeof o.luckEnabled === 'boolean' ? o.luckEnabled : undefined, // 행운 깎기 사용 여부(미설정=기본 사용)
     vnOverlay: typeof o.vnOverlay === 'boolean' ? o.vnOverlay : undefined, // VN 오버레이 표시 여부(미설정=꺼짐)
     bgm: coerceLoadedBgmList(o.bgm),
@@ -1170,7 +1256,7 @@ export class RoomStore {
    *
    * 방 전체 스냅샷은 8초마다 몰아서 쓴다. 그 사이에 서버가 내려가면 그 몇 초가 사라지고,
    * 스냅샷 쓰기가 막힌 방(너무 커서 직렬화가 안 되거나 디스크가 찬 경우)은 재시작하는 순간
-   * 마지막 저장 이후가 통째로 사라진다 — 실제로 그렇게 잃었다.
+   * 마지막 저장 이후가 통째로 사라진다.
    * 그래서 말은 오간 즉시 이 기록장에 한 줄씩 남기고, 스냅샷이 성공한 만큼만 잘라 낸다.
    * 쓰기가 실패해도 대화 자체는 막지 않는다(대신 관리 화면에 남긴다).
    */
@@ -1724,6 +1810,7 @@ export class RoomStore {
       cardImage: capImage(host.cardImage),
       participants: new Map([[self.playerId, self]]),
       characters: new Map(),
+      charPool: new Map(),
       handouts: new Map(),
       maps: new Map([[firstMap.id, firstMap]]),
       activeMapId: firstMap.id,
@@ -1756,6 +1843,8 @@ export class RoomStore {
     if (!roomId) return { error: '존재하지 않는 초대 코드입니다.' }
     const room = this.rooms.get(roomId)
     if (!room) return { error: '방을 찾을 수 없습니다.' }
+    const shut = this.lockedOut(room, player)
+    if (shut) return shut
     return this.admit(room, player)
   }
 
@@ -1770,7 +1859,25 @@ export class RoomStore {
     if (acct && room.ownerId !== acct && !room.members.has(acct)) {
       return { error: '이 세션의 멤버가 아닙니다. 초대 코드로 입장하세요.' }
     }
+    const shut = this.lockedOut(room, player)
+    if (shut) return shut
     return this.admit(room, player)
+  }
+
+  /**
+   * 잠긴 방인가 — 방을 만든 사람 말고는 못 들어온다.
+   *
+   * 이미 들어와 있던 사람(끊겼다 돌아오는 사람 포함)은 통과시킨다. 잠금은 '준비 중이니 새로 들어오지
+   * 말라'는 뜻이지, 하던 사람을 끊는 기능이 아니다 — 그렇게 하면 GM 이 잠근 순간 방이 텅 빈다.
+   */
+  private lockedOut(
+    room: Room,
+    player: { playerId: string; accountId?: string }
+  ): { error: string } | null {
+    if (!room.locked) return null
+    if (player.accountId && room.ownerId === player.accountId) return null
+    if (room.participants.has(player.playerId)) return null
+    return { error: '지금은 준비 중이라 들어올 수 없습니다. 방을 만든 사람에게 물어봐 주세요.' }
   }
 
   /** 공통 입장 처리: 멤버 등록 + 재접속/신규 참가자(소유자=GM, 그 외 PL). */
@@ -1855,6 +1962,8 @@ export class RoomStore {
     room.members.delete(accountId)
     room.participants.delete(playerId)
     room.characters.delete(playerId)
+    // 아주 떠난 사람의 보관대 몫도 걷는다 — 안 걷으면 그 사람 그림이 방 파일과 입장 전송에 영원히 남는다.
+    this.dropPooledFor(room, playerId)
     room.charRooms.delete(playerId)
     room.lastActivityAt = Date.now() // dirty 마킹 — 자동저장(flushDirty)이 영속화
     return { ok: true }
@@ -1925,6 +2034,18 @@ export class RoomStore {
     room.madnessTables = coerceMadnessTables(tables)
     room.lastActivityAt = Date.now()
     return { ok: true, tables: room.madnessTables }
+  }
+
+  /**
+   * 입실 잠금(공사중) 설정 — 방을 만든 사람 말고는 못 들어오게 한다.
+   * 이미 들어와 있는 사람은 내보내지 않는다(준비 중에 문만 닫는 것이지 쫓아내는 기능이 아니다).
+   */
+  setLocked(roomId: string, locked: boolean): { ok: boolean; locked: boolean } {
+    const room = this.rooms.get(roomId)
+    if (!room) return { ok: false, locked: false }
+    room.locked = locked || undefined
+    room.lastActivityAt = Date.now()
+    return { ok: true, locked }
   }
 
   /** 행운 깎기(CoC7 하우스룰) 사용 여부 설정(GM 전용 — 권한 검증은 호출 측 relay). {ok,enabled} 반환. */
@@ -2232,8 +2353,37 @@ export class RoomStore {
       bio: typeof char.bio === 'string' ? char.bio.slice(0, 500) : undefined // 자기소개 길이 바운드
     }
     room.characters.set(char.playerId, stored)
+    // 지금 장착한 캐릭터는 곧 갈아입히면 로스터에서 밀려난다. 맵에 토큰을 놓아 둔 캐릭터가 그때
+    // 이름·색·두상·수치를 잃지 않도록, 캐릭터별로도 한 벌 남겨 둔다(같은 값의 사본).
+    if (stored.charId) this.setPooledCharacter(room, stored)
     room.lastActivityAt = Date.now()
     return stored
+  }
+
+  /**
+   * 캐릭터 보관대 — (playerId, charId) 로 색인한다. 로스터가 '지금 말하는 캐릭터' 한 명만 담는 것과 달리,
+   * 여기에는 이 방에서 쓰인 적 있는 캐릭터가 함께 남는다. 맵 토큰이 charId 로 자기 캐릭터를 찾을 때 본다.
+   */
+  private setPooledCharacter(room: Room, char: SharedCharacter): void {
+    const key = poolKey(char.playerId, char.charId)
+    if (!key) return
+    // 지운 뒤 다시 넣어 '가장 최근'이 맨 뒤로 가게 한다 — Map 은 이미 있는 키를 덮어써도 자리를 안 바꾼다.
+    // 그대로 두면 아래 축출이 '오래 안 쓴 것'이 아니라 '먼저 담긴 것'을 버려, 지금 쓰는 캐릭터가 밀려난다.
+    room.charPool.delete(key)
+    room.charPool.set(key, poolSubset(char))
+    trimCharPool(room)
+  }
+
+  /** 방을 아주 떠난 사람의 보관대 몫을 걷는다(재접속이 아니라 멤버십이 끊긴 경우). */
+  private dropPooledFor(room: Room, playerId: string): void {
+    const head = playerId.length + ':' + playerId
+    for (const k of [...room.charPool.keys()]) if (k.startsWith(head)) room.charPool.delete(k)
+  }
+
+  /** 보관대에 담긴 캐릭터 전부(스냅샷·입장 전달용). */
+  charPool(roomId: string): SharedCharacter[] {
+    const room = this.rooms.get(roomId)
+    return room ? [...room.charPool.values()] : []
   }
 
   /**
@@ -2328,8 +2478,8 @@ export class RoomStore {
    * 새 맵 생성. 저장본(와이어) + 표시 맵 목록이 바뀐 통합 토큰들을 함께 반환(방 없으면 undefined).
    *
    * 가져오기로 들어온 통합 레이어에는 '이 맵들에서만 보임'(mapIds)이 박혀 있다. 그래서 새 맵세트를
-   * 만들면 통합 레이어가 아무것도 안 보이는 빈 판이 나왔다 — 바로 아래 duplicateMap 은 이어받는데
-   * 여기만 빠져 있었다. 만든 사람이 보고 있던 맵에 보이던 것만 이어받는다(전부 이어받으면 서로 다른
+   * 만들 때 이어받지 않으면 통합 레이어가 아무것도 안 보이는 빈 판이 나온다 — 바로 아래 duplicateMap
+   * 과 짝을 맞춘다. 만든 사람이 보고 있던 맵에 보이던 것만 이어받는다(전부 이어받으면 서로 다른
    * 배치를 두 번 가져온 방에서 새 맵에 두 배치가 겹쳐 쏟아진다).
    *
    * ⚠ 기준 맵은 부르는 쪽이 알려 준다(baseMapId). 맵 전환은 개인 뷰라 room.activeMapId 는 전원 강제
@@ -2595,6 +2745,48 @@ export class RoomStore {
     if (!t) return undefined
     return this.rooms.get(roomId)?.visualCards?.find((c) => c.name === t)
   }
+
+  /**
+   * 판정 결과로 카드 찾기 — 이름이 딱 떨어지지 않아도 발동한다.
+   *
+   * 카드 이름이 '성공' 처럼 결과 라벨과 **정확히 같아야만** 뜨게 두면, GM 이 '성공 컷인'·'대성공!'
+   * 처럼 지은 카드는 영영 안 떠서 판정 컷인은 사실상 못 쓰고 텍스트로 부르는 길만 남는다.
+   *
+   * 그래서 '이름에 그 라벨이 들어 있으면' 발동으로 넓히되, 한 가지를 지킨다: '대성공!' 은 '성공'
+   * 카드로도 읽히므로, 카드마다 **이름에 들어 있는 라벨 중 가장 긴 것**을 그 카드의 뜻으로 보고
+   * 그것이 이번 결과의 라벨일 때만 튼다. 일반 성공에 '대성공!' 카드가 새어 나오지 않는다.
+   *
+   * @param keys 이번 결과의 라벨들(구체적인 것이 앞).
+   * @param allKeys 이 룰에서 나올 수 있는 라벨 전부 — 어느 라벨이 더 구체적인지 견주는 데 쓴다.
+   */
+  findCardForResult(roomId: string, keys: string[], allKeys: string[]): VisualCard | undefined {
+    const cards = this.rooms.get(roomId)?.visualCards
+    if (!cards?.length || !keys.length) return undefined
+    // keys 는 구체적인 것이 앞이다('대성공' → '성공'). 그 차례를 점수로 삼아, 더 구체적인 라벨을 뜻하는
+    // 카드가 언제나 이긴다. 등록 순서로 이기게 두면 '성공' 카드를 먼저 만든 방에서 대성공에도 그것이 뜬다.
+    const rank = new Map(keys.map((k, i) => [k, i]))
+    let hit: VisualCard | undefined
+    let hitRank = Number.MAX_SAFE_INTEGER
+    let hitExact = false
+    for (const c of cards) {
+      const name = (c.name ?? '').trim()
+      if (!name) continue
+      // 이름이 라벨 그대로면 그 라벨을 뜻하는 것이 분명하다. 아니면 이름이 품은 라벨 중 가장 긴 것으로 본다.
+      const exact = rank.has(name)
+      let best = ''
+      if (!exact) for (const k of allKeys) if (k && name.includes(k) && k.length > best.length) best = k
+      const key = exact ? name : best
+      const r = key ? rank.get(key) : undefined
+      if (r === undefined) continue
+      // 같은 구체성이면 이름이 라벨과 똑같은 쪽을 먼저, 그다음은 등록순.
+      if (r < hitRank || (r === hitRank && exact && !hitExact)) {
+        hit = c
+        hitRank = r
+        hitExact = exact
+      }
+    }
+    return hit
+  }
   /**
    * 채팅·스크립트 본문으로 카드 찾기 — 화면에 보이는 평문 기준으로 카드 이름이 '포함'되면 그 카드.
    * 문장 속 키워드·스크립트 본문 키워드도 발동한다. 여러 카드가 매칭되면 이름이 긴(더 구체적인) 카드
@@ -2779,6 +2971,7 @@ export class RoomStore {
       rotation:
         typeof req.rotation === 'number' && Number.isFinite(req.rotation) ? req.rotation : existing?.rotation,
       charPlayerId: capId(req.charPlayerId) ?? existing?.charPlayerId,
+      charId: capId(req.charId) ?? existing?.charId,
       label: typeof req.label === 'string' ? req.label.slice(0, 200) : existing?.label,
       color: typeof req.color === 'string' ? req.color.slice(0, 32) : existing?.color,
       image: capImage(req.image) ?? existing?.image,
@@ -2821,7 +3014,7 @@ export class RoomStore {
       // 가져오기 출처 태그 — 편집(upsert)으로는 바뀌지 않는다(가져오기·로드에서만 부여).
       importId: existing?.importId,
       // 표시 맵 제한 — null 이면 해제(모든 맵에 표시), 배열이면 그 목록, 미지정이면 기존 보존.
-      // 가져오기가 박아 둔 제한을 사람이 풀 수 있어야 한다(새 맵세트가 빈 판으로 보이던 원인).
+      // 가져오기가 박아 둔 제한을 사람이 풀 수 있어야 한다(못 풀면 새 맵세트가 빈 판으로 보인다).
       mapIds:
         req.mapIds === null
           ? undefined
@@ -3238,6 +3431,8 @@ export class RoomStore {
       cardImage: src.cardImage,
       participants: new Map(),
       characters: new Map(),
+      // 토큰은 그대로 복사되므로 보관대도 함께 옮긴다 — 아니면 복사한 방에서 토큰이 이름을 잃는다.
+      charPool: new Map(src.charPool),
       handouts,
       maps,
       activeMapId: maps.has(src.activeMapId) ? src.activeMapId : (maps.keys().next().value as string),
@@ -3252,6 +3447,7 @@ export class RoomStore {
             summary: [...src.madnessTables.summary]
           }
         : undefined,
+      // 잠금은 복제본에 옮기지 않는다 — 복사한 방은 새로 준비하는 방이라 문을 열어 둔 채 시작한다.
       luckEnabled: src.luckEnabled, // 행운 깎기 사용 여부 복제
       vnOverlay: src.vnOverlay, // VN 오버레이 표시 여부 복제
       bgm: src.bgm.map((t) => ({ ...t })),
@@ -3300,6 +3496,8 @@ export class RoomStore {
       cardImage: room.cardImage,
       participants: this.participants(room),
       characters: [...room.characters.values()],
+      // 로스터에 없는(지금 아무도 장착하지 않은) 캐릭터도 함께 — 그 캐릭터의 토큰이 이름·수치를 그린다.
+      charPool: [...room.charPool.values()],
       messages,
       avatarPool, // 채팅 두상 풀 — 클라가 avatarRef 복원에 사용
       handouts: viewer ? this.handoutsFor(room, viewer) : [...room.handouts.values()],
@@ -3318,6 +3516,7 @@ export class RoomStore {
       cutInImages: room.cutInImages,
       dimColor: room.dimColor,
       madnessTables: room.madnessTables, // GM 커스텀 광기표
+      locked: room.locked, // 입실 잠금(공사중)
       luckEnabled: room.luckEnabled, // 행운 깎기 사용 여부
       vnOverlay: room.vnOverlay, // VN 오버레이 표시 여부
       bgm: room.bgm,
@@ -3447,7 +3646,9 @@ export class RoomStore {
           () => [...room.maps.values()].map(toWireMap),
           () => [...room.handouts.values()],
           () => [...room.channels.values()],
-          () => room.characters ?? [],
+          // Map 을 그대로 넘기면 '{}' 로 직렬화돼 아무것도 못 훑는다 — 값 배열로 펴서 넘긴다.
+          () => [...room.characters.values()],
+          () => [...room.charPool.values()],
           () => [room.appearance, room.cutInImage, room.cutInImages, room.bgm, room.saveSlots, room.visualCards]
         ]) {
           try {

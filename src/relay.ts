@@ -35,7 +35,7 @@ import type { IncomingMessage } from 'node:http'
 import type { Server as HttpsServer } from 'node:https'
 import { createServer as createHttpsServer } from 'node:https'
 import { RoomStore, canViewHandout, canSeeToken, tokenForViewer, tokenVisibility, type Room } from './rooms'
-import { parseCommand, resolveInlineRolls, diceCardKeywords } from './dice/engine'
+import { parseCommand, resolveInlineRolls, allCardKeywords, diceCardKeywords } from './dice/engine'
 import { createAuthStore, type AuthStore, type PublicAccount } from './auth'
 import { createCharacterStore, type CharacterStore } from './characters'
 import { createAssetStore, collectAssetRefs as scanAssetRefs, type AssetStore } from './assets'
@@ -536,6 +536,11 @@ export function createRelay(opts?: {
   cmtyEcon.sweepGifts(Date.now())
   const giftSweeper = setInterval(() => cmtyEcon.sweepGifts(Date.now()), 60 * 60 * 1000)
   giftSweeper.unref?.()
+
+  // 삭제함의 보관 기한(30일)이 지난 글을 실제로 지운다. 화면은 이 약속을 이미 안내하고 있다.
+  cmtyPosts.purgeExpired(Date.now())
+  const trashSweeper = setInterval(() => cmtyPosts.purgeExpired(Date.now()), 6 * 60 * 60 * 1000)
+  trashSweeper.unref?.()
 
   // ── 커뮤니티 라우트 ────────────────────────────────────────────────────
   // 백 개 남짓이라 별도 모듈의 표로 두고 여기서는 배선만 한다(각 항목이 필요한 권한을 자기 옆에 적는다).
@@ -1942,8 +1947,8 @@ export function createRelay(opts?: {
         const liveSizes = assets.sizesOf(globalLive)
         let liveBytes = 0
         for (const h of globalLive) liveBytes += liveSizes.get(h) ?? 0
-        // '회수 가능'은 실제 청소가 지울 것과 같은 코드로 센다(dry-run). 예전에는 단순 뺄셈이라
-        // 유예 중인 파일까지 회수 가능으로 보여, 눌러도 0 이 나오는 일이 반복됐다.
+        // '회수 가능'은 실제 청소가 지울 것과 같은 코드로 센다(dry-run). 단순 뺄셈으로 세면
+        // 유예 중인 파일까지 회수 가능으로 보여, 눌러도 0 이 나오는 일이 반복된다.
         const orphan = assets.orphanStats(globalLive)
         const summary = {
           accountCount: accountsList.length,
@@ -3667,13 +3672,8 @@ export function createRelay(opts?: {
         if (named) {
           io.to(roomId).emit('room:cardplay', { card: named })
         } else {
-          for (const key of diceCardKeywords(message.dice)) {
-            const card = store.findCardByTitle(roomId, key)
-            if (card) {
-              io.to(roomId).emit('room:cardplay', { card })
-              break
-            }
-          }
+          const card = store.findCardForResult(roomId, diceCardKeywords(message.dice), allCardKeywords())
+          if (card) io.to(roomId).emit('room:cardplay', { card })
         }
       }
     })
@@ -3736,13 +3736,9 @@ export function createRelay(opts?: {
       io.to(roomId).emit('chat:new', message)
       // 시트 굴림도 결과 라벨(성공/실패/단계)로 비주얼 카드 발동 — 공개 굴림만, 광기(madness)는 라벨 없음.
       if (message.kind === 'dice' && message.dice) {
-        for (const key of diceCardKeywords(message.dice)) {
-          const card = store.findCardByTitle(roomId, key)
-          if (card) {
-            io.to(roomId).emit('room:cardplay', { card })
-            break
-          }
-        }
+        // 시트·팔레트에서 굴린 것도 채팅에 직접 친 판정과 같은 규칙으로 카드를 찾는다.
+        const card = store.findCardForResult(roomId, diceCardKeywords(message.dice), allCardKeywords())
+        if (card) io.to(roomId).emit('room:cardplay', { card })
       }
     })
 
@@ -3880,8 +3876,8 @@ export function createRelay(opts?: {
       if (!sender) return
       const res = store.selectChoice(roomId, req.messageId, req.optionId, playerId)
       if (!res) {
-        // 중복 응답·무효 옵션·서버가 모르는 선택지. 지금까지는 조용히 끝나서 '눌러도 아무 일이 없다'로만
-        // 보였다 — 왜 안 되는지 누른 사람에게 알린다(히스토리에는 남기지 않는 일회성 안내).
+        // 중복 응답·무효 옵션·서버가 모르는 선택지. 조용히 끝내면 '눌러도 아무 일이 없다'로만
+        // 보인다 — 왜 안 되는지 누른 사람에게 알린다(히스토리에는 남기지 않는 일회성 안내).
         io.to('user:' + playerId).emit('chat:new', {
           id: randomUUID(),
           time: Date.now(),
@@ -4030,7 +4026,7 @@ export function createRelay(opts?: {
     })
 
     // 스탠딩 빼고 '누구로 말하는가'만 즉시 반영 — 스탠딩 업로드를 기다리는 사이에 친 말이
-    // 옛 캐릭터로 각인되던 것을 막는다. 보관 중인 스탠딩은 같은 캐릭터일 때만 유지(mergeIdentity).
+    // 옛 캐릭터로 각인되는 것을 막는다. 보관 중인 스탠딩은 같은 캐릭터일 때만 유지(mergeIdentity).
     socket.on('char:identity', (req) => {
       const roomId = socket.data.roomId
       if (!roomId || !req) return
@@ -4526,6 +4522,14 @@ export function createRelay(opts?: {
       if (res.ok) io.to(roomId).emit('room:luck', { enabled: res.enabled })
     })
 
+    // 입실 잠금(공사중 · GM 전용) — 전원 동기화. 이미 들어와 있는 사람은 그대로 둔다.
+    socket.on('room:lock', (req) => {
+      const roomId = gmRoomId()
+      if (!roomId || !req) return
+      const res = store.setLocked(roomId, req.locked === true)
+      if (res.ok) io.to(roomId).emit('room:lock', { locked: res.locked })
+    })
+
     // 일반 맵 VN 오버레이 표시(GM 전용) — 전원 동기화.
     socket.on('room:vnoverlay', (req) => {
       const roomId = gmRoomId()
@@ -4600,7 +4604,7 @@ export function createRelay(opts?: {
       if (!res || !room) return
       io.to(roomId).emit('map:added', res.map)
       // 새 맵에 이어붙은 통합 레이어를 실제로 내려보낸다 — 이게 없으면 서버만 고쳐지고 화면은 그대로다
-      // (지금까지 복제 맵이 정확히 그 상태였다: 다시 들어와야 보였다).
+      // (복제 맵이 정확히 그 자리다: 안 보내면 다시 들어와야 보인다).
       emitGlobalTokens(room, roomId, res.touchedGlobals)
     })
 
@@ -5159,7 +5163,7 @@ export function createRelay(opts?: {
 
     // ===== 커뮤니티 — 보고 있는 게시판·글의 룸으로 갈아탄다 =====
     // ⚠들어가기 전에 반드시 이전 룸을 떠난다. 안 그러면 화면을 옮길 때마다 소속이 쌓여
-    //   상관없는 게시판의 사건까지 계속 받게 된다(이전에 같은 형태의 누수를 겪었다).
+    //   상관없는 게시판의 사건까지 계속 받게 된다.
     const cmtyLeave = (): void => {
       for (const r of socket.data.cmtyRooms ?? []) void socket.leave(r)
       socket.data.cmtyRooms = []

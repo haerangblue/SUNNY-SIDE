@@ -5,7 +5,7 @@ import type { DiceResult, SuccessLevel } from './dice/types'
 
 /** 서버 프로그램 버전(배포 스냅샷 날짜) — GET /health 의 ver 로 노출. 클라이언트가 자가호스팅
  *  서버의 구버전 여부를 판별하는 근거이므로, 서버 기능이 바뀔 때마다 그 날짜로 갱신한다. */
-export const SERVER_VERSION = '2026-08-12'
+export const SERVER_VERSION = '2026-08-13'
 
 export type ChatChannel = 'main' | 'ooc' | 'whisper' | 'group'
 // script = /desc 프로필 없는 꾸미기 스크립트(클라가 아바타·이름 없이 꾸미기 마크업으로 렌더).
@@ -614,6 +614,9 @@ export interface RoomState {
    */
   charPool?: SharedCharacter[]
   messages: ChatMessage[]
+  /** 여기 실린 대화보다 앞선 몫이 보관소에 남아 있는가 — 채팅 창의 '보관된 이전 대화 불러오기' 표시 조건.
+   *  옛 서버는 안 보낸다(그 경우 보관소 자체가 없다). */
+  archived?: boolean
   handouts: Handout[]
   /** 방의 모든 맵세트. */
   maps: GameMap[]
@@ -726,6 +729,27 @@ export interface ChatRollReq {
   to?: string
   groupId?: string
   secret?: boolean
+}
+
+/**
+ * 보관된 지난 대화 되읽기 요청.
+ * 방이 메모리에 들고 있는 몫보다 앞선 대화는 보관소에 남아 있고, 이 요청으로 뒤에서부터 한 묶음씩 가져온다.
+ */
+export interface ChatOlderReq {
+  /** 이어 읽을 지점 — 앞선 응답이 준 것을 그대로 돌려준다. 없으면 보관소의 맨 끝부터. */
+  cursor?: { part: number; line: number }
+  /** 한 번에 받을 대화 수(서버가 상한으로 깎는다). */
+  limit?: number
+}
+
+/** 되읽기 응답 — 입장 스냅샷과 같은 꼴(두상은 풀로 분리). */
+export interface ChatOlderRes {
+  /** 오래된 순으로 정렬된 보관 대화. 열람권이 없는 것은 빠져 있다. */
+  messages: ChatMessage[]
+  /** 두상 풀 — messages 의 avatarRef 가 가리킨다(입장 스냅샷과 동일). */
+  avatarPool?: string[]
+  /** 다음에 이어 읽을 지점. null 이면 보관소를 끝까지 읽었다. */
+  cursor: { part: number; line: number } | null
 }
 
 /** 핸드셰이크 시 socket.handshake.auth 로 전달. */
@@ -929,6 +953,9 @@ export interface ClientToServerEvents {
   // 보낸 채팅 수정/삭제. 수정=작성자 본인 또는 GM(텍스트 메시지만), 삭제=GM 만. 서버가 검증 후 브로드캐스트.
   'chat:edit': (req: { id: string; text: string }) => void
   'chat:delete': (req: { id: string }) => void
+  // 보관된 지난 대화 되읽기 — 방이 메모리에 들고 있는 몫보다 앞선 대화를 뒤에서부터 한 묶음씩.
+  // cursor 는 서버가 준 것을 그대로 돌려주면 되고, 없으면 보관소의 맨 끝부터. 열람권은 서버가 거른다.
+  'chat:older': (req: ChatOlderReq, ack: Ack<ChatOlderRes>) => void
   // 입력 중 표시(휘발) — 타이핑 시작/정지를 방 전체에 알림(저장 안 함). channel/groupId 로 어느 탭에서 치는지 전달.
   'chat:typing': (req: { typing: boolean; channel?: ChatChannel; groupId?: string }) => void
   // 캐릭터 프레즌스 공유. playerId 는 서버가 스탬프.

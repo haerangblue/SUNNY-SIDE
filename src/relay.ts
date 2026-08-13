@@ -377,6 +377,12 @@ export function createRelay(opts?: {
   const socialRate = new Map<string, { count: number; resetAt: number }>()
   // 프레즌스 상태 변경 레이트리밋 — presence:set 폭주(동기 디스크쓰기·전역 브로드캐스트 반복) 차단.
   const presenceRate = new Map<string, { count: number; resetAt: number }>()
+  // 보관 대화 되읽기(chat:older) 부하 가드 — 아래 둘을 함께 쓴다.
+  // 사람 단위: 창을 여러 개 띄워도(소켓이 여러 개라도) 한 번에 한 요청만. 소켓 단위로 재면 창 수만큼 뚫린다.
+  const olderBusyBy = new Set<string>()
+  // 서버 단위: 조각 하나를 통째로 읽는 동기 작업이라, 동시에 몰리면 그만큼 서버 전체가 멈춘다. 끝을 둔다.
+  let olderInFlight = 0
+  const OLDER_INFLIGHT_MAX = 4
   const LIKE_REWARD = 10 // 새 방문자가 내 방에 좋아요를 누르면 소유주가 받는 코인(쌍당 1회 — 파밍 불가)
   const MARKET_FEE_PCT = 10 // 마켓 판매 수수료(%) — 창작자는 가격의 90%를 받고 10%는 소각(sink)
   const MARKET_FILE_MAX = 256 * 1024 // 마켓 이미지 파일당 최대 바이트(강한 캡)
@@ -1286,6 +1292,24 @@ export function createRelay(opts?: {
         const messages = peer ? dm.thread(account.id, peer) : []
         res.writeHead(200, { 'content-type': 'application/json' })
         res.end(JSON.stringify({ ok: true, messages }))
+      })
+      return
+    }
+    // DM 열람 — 본문 { token, peer }. 그 상대의 종 알림만 읽음 처리한다.
+    // 예전에는 종 드롭다운을 여는 것 말고는 DM 알림을 끌 길이 없어, 대화창에서 다 읽은 뒤에도 서버에는
+    // 미읽음으로 남았고 재접속·새로고침 때마다 그대로 다시 심어졌다. 그룹 대화는 종 알림을 만들지 않으므로 대상이 아니다.
+    if (req.method === 'POST' && req.url === '/dm/read') {
+      void readJsonBody(req).then((body) => {
+        const account = typeof body.token === 'string' ? auth.verifyToken(body.token) : null
+        if (!account) {
+          res.writeHead(401, { 'content-type': 'application/json' })
+          res.end(JSON.stringify({ ok: false, error: '인증이 필요합니다.' }))
+          return
+        }
+        const peer = typeof body.peer === 'string' ? body.peer : ''
+        const changed = peer ? notif.markReadByActor(account.id, 'dm', peer) : 0
+        res.writeHead(200, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ ok: true, changed }))
       })
       return
     }
@@ -3951,6 +3975,56 @@ export function createRelay(opts?: {
       const audience = before ? messageAudience(room, before) : [roomId]
       const id = store.deleteMessage(roomId, req.id, sender.role === 'GM')
       if (id) io.to(audience).emit('chat:deleted', { id })
+    })
+
+    // 보관된 지난 대화 되읽기 — 방이 메모리에 들고 있는 몫보다 앞선 대화.
+    // 열람권은 스토어가 거르고(귓속말·비밀·남의 그룹), 두상은 입장 스냅샷과 같이 풀로 분리해 자산 참조로 보낸다.
+    //
+    // 되읽기는 디스크를 읽는 무거운 일이라, 겹쳐 부르면 서버 전체가 그만큼 멈춘다.
+    // 앞선 요청이 끝나기 전에는 다음 요청을 받지 않는다(정상 사용은 응답을 받고 다음 장을 부른다).
+    // 사람 단위로 재야 창을 여러 개 띄워 겹쳐 부르는 길이 막히고, 서버 단위 상한이 나머지를 받친다.
+    socket.on('chat:older', (req, ack) => {
+      if (olderBusyBy.has(playerId)) {
+        ack?.({ ok: false, error: '앞서 요청한 대화를 아직 불러오는 중입니다.' })
+        return
+      }
+      if (olderInFlight >= OLDER_INFLIGHT_MAX) {
+        ack?.({ ok: false, error: '지금 보관 대화를 읽는 사람이 많습니다. 잠시 뒤 다시 시도해 주세요.' })
+        return
+      }
+      olderBusyBy.add(playerId)
+      olderInFlight++
+      void (async () => {
+        try {
+          const roomId = socket.data.roomId
+          const room = roomId ? store.getRoom(roomId) : undefined
+          const viewer = room?.participants.get(playerId)
+          if (!roomId || !room || !viewer) {
+            ack?.({ ok: false, error: '세션에 들어가 있지 않습니다.' })
+            return
+          }
+          const c = req?.cursor
+          const cursor =
+            c && Number.isInteger(c.part) && c.part > 0 && Number.isInteger(c.line) && c.line >= -1
+              ? { part: c.part, line: c.line }
+              : null
+          const limit = Number.isFinite(req?.limit) ? Number(req?.limit) : 200
+          const got = store.archivedFor(roomId, { playerId, role: viewer.role }, cursor, limit)
+          if (!got) {
+            ack?.({ ok: false, error: '보관된 대화를 읽을 수 없습니다.' })
+            return
+          }
+          const pool = got.avatarPool.length ? await Promise.all(got.avatarPool.map(internalizeInlineImage)) : []
+          ack?.({ ok: true, data: { messages: got.messages, avatarPool: pool, cursor: got.cursor } })
+        } catch (e) {
+          // 응답 없이 끝나면 클라는 시간 초과로 8초를 기다린다 — 사유를 그대로 돌려준다.
+          console.error(`[relay] chat:older 실패(${playerId}):`, e)
+          ack?.({ ok: false, error: '보관된 대화를 읽지 못했습니다.' })
+        } finally {
+          olderBusyBy.delete(playerId)
+          olderInFlight--
+        }
+      })()
     })
 
     // ===== 입력 중 표시 (휘발 — 저장 안 함, 발신자 제외 방 전체) =====
